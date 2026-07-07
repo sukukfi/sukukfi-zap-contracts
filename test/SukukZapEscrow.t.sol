@@ -466,6 +466,30 @@ contract SukukZapEscrowTest {
         require(usdeToken.balanceOf(user) == 0, "USDe was already converted, must not also refund USDe");
     }
 
+    // ── 19b. touch() requires a buffer above i.minOut for HONEY actions, since
+    //         i.minOut is HONEY-denominated (the minted output) but touch()
+    //         observes pre-mint USDe — see HONEY_ARM_BUFFER_BPS ────────────────
+
+    function testHoneyTouchRequiresBufferAboveMinOut() public {
+        SukukZapEscrow.Intent memory i = _intentA(2, user, escrow.HONEY_VAULT_ID(), 1e18, 90);
+        bytes32 salt = keccak256(abi.encode(i));
+        address a = escrow.intentAddress(i);
+
+        // Exactly i.minOut in raw USDe must NOT arm — this is the exact
+        // "cheaper early-arm" gap the audit flagged: a sub-100% mint rate means
+        // i.minOut USDe in doesn't guarantee i.minOut HONEY out.
+        usdeToken.mint(a, 1e18);
+        vm.prank(address(0xBEEF));
+        escrow.touch(i);
+        require(escrow.firstTouchedAt(salt) == 0, "exactly minOut in USDe must not arm a HONEY intent's clock");
+
+        // Reaching the documented buffer (110% of minOut) does arm it.
+        usdeToken.mint(a, 0.1e18); // total 1.1e18 = 110% of minOut
+        vm.prank(address(0xBEEF));
+        escrow.touch(i);
+        require(escrow.firstTouchedAt(salt) != 0, "110% of minOut in USDe must arm a HONEY intent's clock");
+    }
+
     // ── 20. USDe→HONEY→trUST (action 3): mints then hands HONEY to operator ──
 
     function testHoneyTrustHandoffHappyPath() public {

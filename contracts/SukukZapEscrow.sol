@@ -38,6 +38,36 @@ interface IHoneyFactory {
     function isBasketModeEnabled(bool isMint) external view returns (bool);
 }
 
+// ── Shared safe-transfer helpers ────────────────────────────────────────────
+//
+// Free functions (not tied to either contract below) since both IntentExecutor
+// and SukukZapEscrow move value and both need the same tolerance. IERC20.transfer
+// and IERC20.approve are declared to return bool, so Solidity's ABI decoder
+// reverts on zero-length return data — which a non-compliant token (canonical
+// USDT and others) returns on success instead of an encoded `true`. Any
+// configured asset behaving that way would otherwise revert every call site
+// that touches it unconditionally, including IntentExecutor.sweep() (the first
+// hop that moves funds out of `A`, used by every settle path AND userReclaim),
+// bricking settlement, refunds, and the reclaim escape hatch simultaneously.
+// This mirrors OpenZeppelin's SafeERC20 pattern without adding the dependency,
+// consistent with this file's existing minimal-interface-only style.
+
+function _safeERC20Call(address token, bytes memory data) {
+    (bool success, bytes memory returndata) = token.call(data);
+    require(success, "ERC20 call failed");
+    if (returndata.length > 0) {
+        require(abi.decode(returndata, (bool)), "ERC20 call returned false");
+    }
+}
+
+function _safeTransfer(address token, address to, uint256 amount) {
+    _safeERC20Call(token, abi.encodeWithSelector(IERC20.transfer.selector, to, amount));
+}
+
+function _safeApprove(address token, address spender, uint256 amount) {
+    _safeERC20Call(token, abi.encodeWithSelector(IERC20.approve.selector, spender, amount));
+}
+
 /**
  * @title  IntentExecutor
  * @notice Deployed via CREATE2 at a counterfactual address `A` derived from an
@@ -67,7 +97,7 @@ contract IntentExecutor {
         require(msg.sender == deployer, "IntentExecutor: only deployer");
         amount = IERC20(token).balanceOf(address(this));
         if (amount > 0) {
-            require(IERC20(token).transfer(to, amount), "IntentExecutor: transfer failed");
+            _safeTransfer(token, to, amount);
         }
     }
 }
@@ -143,6 +173,32 @@ contract SukukZapEscrow {
     uint8 public constant ACTION_USDE_HONEY_TRUST = 3;
     uint8 public constant HONEY_VAULT_ID = 2;
 
+    // touch()'s arming check for HONEY actions (2/3) observes the pre-mint USDe
+    // balance at the intent's address, but i.minOut is denominated in HONEY (the
+    // MINTED output — see the honeyAmount < i.minOut checks in _settleHoneyDuprt
+    // and _settleHoneyTrust). Because HoneyFactory's mint rate can be sub-100%
+    // (see _mintHoneyOrRefund), a raw USDe balance equal to i.minOut can
+    // understate how much USDe is actually needed to guarantee i.minOut HONEY
+    // out — making it cheaper than intended to arm the reclaim clock on a HONEY
+    // intent. This contract has no on-chain way to preview HoneyFactory's exact
+    // mint rate (the minimal IHoneyFactory interface exposes no rate-preview
+    // function), so this is a conservative, documented safety margin rather
+    // than an exact conversion — tune it if HoneyFactory's real worst-case mint
+    // efficiency is known precisely. 11_000 = require 110% of i.minOut in raw
+    // USDe terms before arming a HONEY intent's clock.
+    uint256 public constant HONEY_ARM_BUFFER_BPS = 11_000;
+
+    // Third-party userReclaim only needs to outlast how long the operator's own
+    // settlement bot could plausibly be down (crash/redeploy, RPC outage, a
+    // botched release) — not any downstream vault fulfillment or trUST minting
+    // time, since operatorSettle() already removes the funds from this escrow's
+    // custody regardless of action type. The user's own self-reclaim is never
+    // gated by this at all (see userReclaim). A deployment with reclaimDelay
+    // below this floor would let anyone touch() then userReclaim() an intent
+    // in the same block, ahead of any honest operator, repeatedly denying
+    // settlement — floor enforced in the constructor below.
+    uint256 public constant MIN_RECLAIM_DELAY = 6 hours;
+
     // ── Storage ──────────────────────────────────────────────────────────────
 
     address public immutable operator;
@@ -190,6 +246,7 @@ contract SukukZapEscrow {
         address _usde
     ) {
         require(_operator != address(0), "operator: zero address");
+        require(_reclaimDelay >= MIN_RECLAIM_DELAY, "reclaimDelay too small");
         operator = _operator;
         reclaimDelay = _reclaimDelay;
         honeyFactory = _honeyFactory;
@@ -295,7 +352,7 @@ contract SukukZapEscrow {
             return;
         }
 
-        require(IERC20(asset).transfer(operator, amount), "handoff transfer failed");
+        _safeTransfer(asset, operator, amount);
         emit IntentHandedToOperator(i.user, i.vaultId, asset, amount);
         _clearTouch(salt);
     }
@@ -360,7 +417,7 @@ contract SukukZapEscrow {
             return;
         }
 
-        require(IERC20(honey).transfer(operator, honeyAmount), "handoff transfer failed");
+        _safeTransfer(honey, operator, honeyAmount);
         emit IntentHandedToOperator(i.user, i.vaultId, honey, honeyAmount);
         _clearTouch(salt);
     }
@@ -424,7 +481,7 @@ contract SukukZapEscrow {
     }
 
     function _refund(address user, address asset, uint256 amount) internal {
-        require(IERC20(asset).transfer(user, amount), "refund transfer failed");
+        _safeTransfer(asset, user, amount);
         emit IntentRefunded(user, asset, amount);
     }
 
@@ -464,11 +521,16 @@ contract SukukZapEscrow {
      *         can still always self-reclaim immediately, unaffected by any
      *         of this). Refusing to arm the clock on an unverifiable "real
      *         funds" signal is safer than arming it on a spoofable one.
+     *
+     *         For HONEY actions (2/3), the floor compared against is not
+     *         `i.minOut` directly but `_armThreshold(i)` — see its docs for why
+     *         the raw USDe balance needs a conservative buffer over `i.minOut`
+     *         rather than a direct comparison.
      */
     function touch(Intent calldata i) external {
         address asset = _resolveReclaimAsset(i);
         bytes32 salt = keccak256(abi.encode(i));
-        if (firstTouchedAt[salt] == 0 && IERC20(asset).balanceOf(intentAddress(i)) >= i.minOut && i.minOut > 0) {
+        if (firstTouchedAt[salt] == 0 && IERC20(asset).balanceOf(intentAddress(i)) >= _armThreshold(i) && i.minOut > 0) {
             firstTouchedAt[salt] = block.timestamp;
         }
     }
@@ -522,7 +584,7 @@ contract SukukZapEscrow {
         uint256 amount = IIntentExecutor(a).sweep(asset, address(this));
         if (amount == 0) return;
 
-        require(IERC20(asset).transfer(i.user, amount), "reclaim transfer failed");
+        _safeTransfer(asset, i.user, amount);
         emit IntentReclaimed(i.user, asset, amount);
         _clearTouch(salt);
     }
@@ -544,6 +606,21 @@ contract SukukZapEscrow {
         address vault = duprtVaults[i.vaultId];
         require(vault != address(0), "unknown vault");
         return IERC7540Vault(vault).asset();
+    }
+
+    /// @dev Used only by touch(). For non-HONEY actions (0/1), the asset
+    ///      observed at `A` pre-settlement IS the asset i.minOut is compared
+    ///      against downstream (see amount < i.minOut in _settleDuprt /
+    ///      _settleTrustHandoff), so no buffer is needed — i.minOut applies
+    ///      directly. For HONEY actions (2/3), the pre-settlement asset is USDe
+    ///      but i.minOut is checked against the MINTED HONEY output downstream,
+    ///      a different unit entirely — see HONEY_ARM_BUFFER_BPS's docs for why
+    ///      a conservative buffer applies here instead of a 1:1 comparison.
+    function _armThreshold(Intent calldata i) internal pure returns (uint256) {
+        if (i.action == ACTION_USDE_HONEY_DUPRT || i.action == ACTION_USDE_HONEY_TRUST) {
+            return (i.minOut * HONEY_ARM_BUFFER_BPS) / 10_000;
+        }
+        return i.minOut;
     }
 
     // ── Internal ──────────────────────────────────────────────────────────────
@@ -582,9 +659,9 @@ contract SukukZapEscrow {
      *      ERC20s that reject changing a non-zero allowance directly.
      */
     function _forceApprove(address token, address spender, uint256 amount) internal {
-        IERC20(token).approve(spender, 0);
+        _safeApprove(token, spender, 0);
         if (amount > 0) {
-            require(IERC20(token).approve(spender, amount), "approve failed");
+            _safeApprove(token, spender, amount);
         }
     }
 }
