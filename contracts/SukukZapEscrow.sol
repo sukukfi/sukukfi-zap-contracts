@@ -68,6 +68,21 @@ function _safeApprove(address token, address spender, uint256 amount) {
     _safeERC20Call(token, abi.encodeWithSelector(IERC20.approve.selector, spender, amount));
 }
 
+// Non-reverting counterpart to _safeTransfer, used only where the caller
+// needs to fall back to a pull-payment credit instead of bricking the whole
+// call on a failing transfer (a blacklisted/reverting recipient on an
+// otherwise-healthy asset). Same non-standard-token tolerance as
+// _safeERC20Call (empty returndata = success), but never reverts — a
+// malformed (non-bool, non-empty) return is treated as failure rather than
+// risking an abi.decode revert.
+function _tryTransfer(address token, address to, uint256 amount) returns (bool ok) {
+    (bool success, bytes memory returndata) = token.call(abi.encodeWithSelector(IERC20.transfer.selector, to, amount));
+    if (!success) return false;
+    if (returndata.length == 0) return true;
+    if (returndata.length != 32) return false;
+    return abi.decode(returndata, (bool));
+}
+
 /**
  * @title  IntentExecutor
  * @notice Deployed via CREATE2 at a counterfactual address `A` derived from an
@@ -95,10 +110,17 @@ contract IntentExecutor {
 
     function sweep(address token, address to) external returns (uint256 amount) {
         require(msg.sender == deployer, "IntentExecutor: only deployer");
-        amount = IERC20(token).balanceOf(address(this));
-        if (amount > 0) {
-            _safeTransfer(token, to, amount);
-        }
+        uint256 balance = IERC20(token).balanceOf(address(this));
+        if (balance == 0) return 0;
+        // Measure what `to` actually received, not this contract's pre-transfer
+        // balance — a fee-on-transfer/deflationary token would otherwise report
+        // more than the escrow ends up holding, and every downstream caller
+        // (requestDeposit sizing, refund sizing) trusts this return value as
+        // ground truth. Also isolates this sweep's own delta from any
+        // pre-existing balance `to` happened to already hold.
+        uint256 toBalanceBefore = IERC20(token).balanceOf(to);
+        _safeTransfer(token, to, balance);
+        amount = IERC20(token).balanceOf(to) - toBalanceBefore;
     }
 }
 
@@ -222,6 +244,18 @@ contract SukukZapEscrow {
     // 0 = never funded yet, or the last funding round already resolved.
     mapping(bytes32 => uint256) public firstTouchedAt;
 
+    // user → asset → amount credited when a refund/reclaim's transfer to that
+    // user reverted (a blacklisted or otherwise-reverting recipient on an
+    // asset that is normally healthy). Every refund/reclaim path used to send
+    // straight to `i.user` with no fallback and no rescue function anywhere
+    // in the contract — if that transfer ever reverted, the funds were
+    // permanently stranded (the same failing transfer blocks both the settle
+    // path's refund AND userReclaim, since both target the same address).
+    // This is the pull-payment escape hatch: the amount is credited here
+    // instead of reverting, and the user can retry via withdrawOwed() once
+    // able to receive again, rather than losing access entirely.
+    mapping(address => mapping(address => uint256)) public owed;
+
     // Reentrancy lock, held in transient storage (EIP-1153) rather than
     // regular storage: TSTORE/TLOAD cost ~100 gas flat versus SSTORE/SLOAD's
     // multi-thousand-gas cold/warm pricing, and transient storage is
@@ -251,6 +285,10 @@ contract SukukZapEscrow {
     event IntentHandedToOperator(address indexed user, uint8 indexed vaultId, address indexed asset, uint256 amount);
     event IntentRefunded(address indexed user, address indexed asset, uint256 amount);
     event IntentReclaimed(address indexed user, address indexed asset, uint256 amount);
+    // Emitted instead of IntentRefunded/IntentReclaimed when the direct
+    // transfer to `user` reverted — see `owed`'s docs.
+    event RefundCredited(address indexed user, address indexed asset, uint256 amount);
+    event OwedWithdrawn(address indexed user, address indexed asset, uint256 amount);
 
     // Emitted exactly once per funding round, the moment touch() durably arms
     // the reclaim clock (see touch()'s docs). This is the only on-chain signal
@@ -481,12 +519,13 @@ contract SukukZapEscrow {
     ///      the real factory's behavior, so we refund whatever the escrow
     ///      actually still holds instead of trusting usdeAmount blindly.
     function _mintHoneyOrRefund(address user, uint256 usdeAmount) internal returns (uint256 honeyAmount) {
+        uint256 balanceBefore = IERC20(usde).balanceOf(address(this));
         _forceApprove(usde, honeyFactory, usdeAmount);
         try IHoneyFactory(honeyFactory).isBasketModeEnabled(true) returns (bool basket) {
             try IHoneyFactory(honeyFactory).mint(usde, usdeAmount, address(this), basket) returns (uint256 minted) {
                 if (minted == 0) {
                     _forceApprove(usde, honeyFactory, 0);
-                    _refundAvailable(user, usde, usdeAmount);
+                    _refundUnconsumed(user, usdeAmount, balanceBefore);
                     return 0;
                 }
                 honeyAmount = minted;
@@ -503,33 +542,75 @@ contract SukukZapEscrow {
         }
     }
 
-    /// @dev Refunds whatever balance of `asset` the escrow actually holds,
-    ///      capped at `cap` — the amount this specific call's own sweep is
-    ///      known to have contributed. Used only for the zero-mint edge case
-    ///      above, where the amount that arrived and the amount still held
-    ///      may legitimately differ (a factory that pulls its full stated
-    ///      input regardless of output leaves nothing to refund; one that
-    ///      pulls nothing leaves the full amount).
+    /// @dev Refunds exactly what THIS call's usdeAmount contribution has left
+    ///      outstanding after a zero-mint, computed from this call's own
+    ///      before/after USDe balance delta rather than the escrow's raw
+    ///      aggregate balance. Used only for the zero-mint edge case above,
+    ///      where the amount that arrived and the amount still held may
+    ///      legitimately differ (a factory that pulls its full stated input
+    ///      regardless of output leaves nothing to refund; one that pulls
+    ///      nothing leaves the full amount).
     ///
-    ///      The cap matters: reading the escrow's raw aggregate balance
-    ///      without one would refund whatever else happens to be sitting in
-    ///      the contract too — a prior intent's uncleaned dust from a partial
-    ///      mint, or a direct external donation to the escrow's own address —
-    ///      misattributing funds that were never this intent's to a user who
-    ///      never delivered them. Capping at `cap` means this call can never
-    ///      pay out more than what it itself is entitled to, regardless of
-    ///      what else the escrow's balance might contain.
-    function _refundAvailable(address user, address asset, uint256 cap) internal {
-        uint256 available = IERC20(asset).balanceOf(address(this));
-        uint256 amount = available < cap ? available : cap;
+    ///      This replaces an earlier version that read the escrow's raw
+    ///      aggregate balanceOf and capped it at usdeAmount: that cap bounds
+    ///      the payout from above (never more than this call contributed) but
+    ///      not from below — it did not verify the funds being paid out
+    ///      actually came from this call rather than a prior intent's
+    ///      uncleaned mint leftover sitting in the same aggregate balance
+    ///      (an audit finding — a later intent's zero-mint refund could pay
+    ///      out an earlier intent's stranded dust to the wrong user).
+    ///      Measuring this call's own consumed = balanceBefore - balanceAfter
+    ///      and refunding usdeAmount - consumed is attribution-correct
+    ///      regardless of what else the escrow's balance contains: any
+    ///      pre-existing balance appears in both balanceBefore and cancels
+    ///      out of `consumed`, and the final `available` cap is a pure
+    ///      solvency backstop, not an attribution mechanism.
+    function _refundUnconsumed(address user, uint256 usdeAmount, uint256 balanceBefore) internal {
+        uint256 balanceAfter = IERC20(usde).balanceOf(address(this));
+        uint256 consumed = balanceBefore > balanceAfter ? balanceBefore - balanceAfter : 0;
+        uint256 unconsumed = consumed < usdeAmount ? usdeAmount - consumed : 0;
+        uint256 amount = unconsumed < balanceAfter ? unconsumed : balanceAfter;
         if (amount > 0) {
-            _refund(user, asset, amount);
+            _refund(user, usde, amount);
         }
     }
 
+    /// @dev Attempts a direct transfer to `user`; if it reverts (a
+    ///      blacklisted or otherwise-reverting recipient on an asset that is
+    ///      normally healthy), credits `owed[user][asset]` instead of
+    ///      reverting the whole settle/refund/reclaim call — an audit finding
+    ///      that every refund/reclaim path shared: they all target `i.user`
+    ///      with no fallback and no rescue function anywhere in the contract,
+    ///      so a single reverting transfer permanently stranded funds (the
+    ///      settle path's refund AND userReclaim both hit the identical
+    ///      failure, since both target the same address). See withdrawOwed().
     function _refund(address user, address asset, uint256 amount) internal {
-        _safeTransfer(asset, user, amount);
-        emit IntentRefunded(user, asset, amount);
+        if (_tryTransfer(asset, user, amount)) {
+            emit IntentRefunded(user, asset, amount);
+        } else {
+            owed[user][asset] += amount;
+            emit RefundCredited(user, asset, amount);
+        }
+    }
+
+    /**
+     * @notice Claims any balance credited via the pull-payment fallback in
+     *         _refund/userReclaim — see `owed`'s docs. Self-service only
+     *         (always pays msg.sender): a third party gains nothing by
+     *         triggering someone else's withdrawal, since the same
+     *         recipient-side failure would block it regardless of caller.
+     * @dev    Zeroes the credited balance before attempting the transfer,
+     *         and uses the reverting _safeTransfer (not _tryTransfer) — if
+     *         the recipient still can't receive (still blacklisted), this
+     *         call reverts and undoes the zeroing too, so the credited
+     *         balance is never lost, only retryable later.
+     */
+    function withdrawOwed(address asset) external nonReentrant returns (uint256 amount) {
+        amount = owed[msg.sender][asset];
+        require(amount > 0, "nothing owed");
+        owed[msg.sender][asset] = 0;
+        _safeTransfer(asset, msg.sender, amount);
+        emit OwedWithdrawn(msg.sender, asset, amount);
     }
 
     // ── User / permissionless reclaim ────────────────────────────────────────
@@ -638,8 +719,16 @@ contract SukukZapEscrow {
         uint256 amount = IIntentExecutor(a).sweep(asset, address(this));
         if (amount == 0) return;
 
-        _safeTransfer(asset, i.user, amount);
-        emit IntentReclaimed(i.user, asset, amount);
+        // Same reverting-recipient fallback as _refund — see owed's docs.
+        // Without this, a blacklisted i.user would revert both this function
+        // AND every settle-path refund, since both target the same address,
+        // permanently stranding funds already swept out of `A`.
+        if (_tryTransfer(asset, i.user, amount)) {
+            emit IntentReclaimed(i.user, asset, amount);
+        } else {
+            owed[i.user][asset] += amount;
+            emit RefundCredited(i.user, asset, amount);
+        }
         _clearTouch(salt);
     }
 

@@ -15,14 +15,23 @@ interface IMintableERC20 {
  *         then mints an equal amount of HONEY to `receiver`. `forceRevert`
  *         lets tests exercise the mint-failure refund path.
  *
- *         Two distinct zero-output modes, since the real factory's exact
+ *         Three non-1:1-success modes, since the real factory's exact
  *         behavior here is unverified from this bundle and the escrow's fix
- *         needs to be safe under either:
+ *         needs to be safe under any of them:
  *         - `forceZeroMintPullsInput`: pulls the full collateral (ERC-4626
  *           `deposit()`-style — input consumed regardless of rounding) but
  *           mints 0 HONEY. The collateral is genuinely gone.
  *         - `forceZeroMintNoPull`: mints 0 HONEY and pulls nothing at all.
  *           The collateral never left the escrow.
+ *         - `partialPullBps` (default 10_000 = 100%, i.e. off): a
+ *           *successful* mint (nonzero HONEY out) that only pulls this
+ *           fraction of the approved `amount`, leaving the rest as unswept
+ *           collateral in the caller (the escrow) — models a sub-100%
+ *           mint rate on the success path, as opposed to the two explicit
+ *           zero-output edge cases above. Exists to reproduce the audit
+ *           finding about cross-intent USDe dust misattribution: this is
+ *           the mode that actually produces leftover dust after a
+ *           *successful* mint, which the two zero-output modes don't.
  */
 contract MockHoneyFactory {
     address public collateral;
@@ -30,6 +39,7 @@ contract MockHoneyFactory {
     bool public forceRevert;
     bool public forceZeroMintPullsInput;
     bool public forceZeroMintNoPull;
+    uint256 public partialPullBps = 10_000;
 
     constructor(address _collateral, address _honeyToken) {
         collateral = _collateral;
@@ -48,6 +58,10 @@ contract MockHoneyFactory {
         forceZeroMintNoPull = v;
     }
 
+    function setPartialPullBps(uint256 v) external {
+        partialPullBps = v;
+    }
+
     function isBasketModeEnabled(bool) external pure returns (bool) {
         return false;
     }
@@ -58,11 +72,15 @@ contract MockHoneyFactory {
         if (forceZeroMintNoPull) {
             return 0; // nothing pulled, nothing minted
         }
-        require(IMintableERC20(collateral).transferFrom(msg.sender, address(this), amount), "MockHoneyFactory: pull failed");
+        uint256 toPull = (amount * partialPullBps) / 10_000;
+        require(IMintableERC20(collateral).transferFrom(msg.sender, address(this), toPull), "MockHoneyFactory: pull failed");
         if (forceZeroMintPullsInput) {
             return 0; // collateral consumed, but nothing minted — the audit's edge case
         }
-        honeyToken.mint(receiver, amount); // 1:1 mint, no fee, for test simplicity
-        return amount;
+        if (toPull == 0) {
+            return 0; // partialPullBps == 0: nothing pulled, nothing minted
+        }
+        honeyToken.mint(receiver, toPull); // 1:1 mint on whatever was actually pulled
+        return toPull;
     }
 }

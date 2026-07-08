@@ -6,6 +6,8 @@ import "./mocks/MockERC20.sol";
 import "./mocks/MockERC7540Vault.sol";
 import "./mocks/MockHoneyFactory.sol";
 import "./mocks/MaliciousReentrantVault.sol";
+import "./mocks/MockBlacklistableERC20.sol";
+import "./mocks/MockFeeOnTransferERC20.sol";
 import "./Vm.sol";
 
 /**
@@ -684,6 +686,125 @@ contract SukukZapEscrowTest {
         vm.prank(operator);
         vm.expectRevert(bytes("action requires HONEY vault"));
         escrow.operatorSettle(i);
+    }
+
+    // ── 22. Blacklisted/reverting recipient credits owed instead of stranding
+    //         funds — proves the pull-payment fallback (audit finding #1) ────
+
+    function testBlacklistedRecipientCreditsOwedInsteadOfStranding() public {
+        MockBlacklistableERC20 blacklistable = new MockBlacklistableERC20("USDC.e", "USDC.e", 6);
+        MockERC7540Vault blVault = new MockERC7540Vault(address(blacklistable));
+
+        SukukZapEscrow blEscrow = new SukukZapEscrow(
+            operator, RECLAIM_DELAY, address(blVault), address(vaultUsdt0), address(vaultHoney),
+            address(honeyFactoryMock), address(honey), address(usdeToken)
+        );
+
+        blacklistable.setBlacklisted(user, true);
+
+        SukukZapEscrow.Intent memory i = _intent(user, 0, 100e6, 300); // minOut above delivered -> refund path
+        address a = blEscrow.intentAddress(i);
+        blacklistable.mint(a, 50e6);
+
+        vm.prank(operator);
+        blEscrow.operatorSettle(i); // must NOT revert despite the blacklisted recipient
+
+        require(blEscrow.owed(user, address(blacklistable)) == 50e6, "refund must be credited to owed, not lost");
+        require(blacklistable.balanceOf(user) == 0, "blacklisted user must not receive funds directly");
+
+        blacklistable.setBlacklisted(user, false);
+        vm.prank(user);
+        uint256 withdrawn = blEscrow.withdrawOwed(address(blacklistable));
+
+        require(withdrawn == 50e6, "withdrawOwed must return the credited amount");
+        require(blacklistable.balanceOf(user) == 50e6, "user must receive funds once withdrawOwed succeeds");
+        require(blEscrow.owed(user, address(blacklistable)) == 0, "owed balance must be cleared after withdrawal");
+    }
+
+    // ── 23. userReclaim's own transfer also falls back to owed on a
+    //         blacklisted recipient, not just the settle-path refund ────────
+
+    function testUserReclaimCreditsOwedOnBlacklistedRecipient() public {
+        MockBlacklistableERC20 blacklistable = new MockBlacklistableERC20("USDC.e", "USDC.e", 6);
+        MockERC7540Vault blVault = new MockERC7540Vault(address(blacklistable));
+
+        SukukZapEscrow blEscrow = new SukukZapEscrow(
+            operator, RECLAIM_DELAY, address(blVault), address(vaultUsdt0), address(vaultHoney),
+            address(honeyFactoryMock), address(honey), address(usdeToken)
+        );
+
+        SukukZapEscrow.Intent memory i = _intent(user, 0, 1e6, 303);
+        address a = blEscrow.intentAddress(i);
+        blacklistable.mint(a, 10e6);
+
+        blacklistable.setBlacklisted(user, true);
+
+        vm.prank(user);
+        blEscrow.userReclaim(i); // must NOT revert
+
+        require(blEscrow.owed(user, address(blacklistable)) == 10e6, "userReclaim must credit owed on a reverting recipient");
+    }
+
+    // ── 24. Fee-on-transfer asset: sweep() reports what the escrow actually
+    //         received, not IntentExecutor's pre-transfer balance (audit's
+    //         fee-on-transfer sweep-amount-mismatch lead) ───────────────────
+
+    function testFeeOnTransferSweepReportsReceivedAmountNotPreTransferAmount() public {
+        MockFeeOnTransferERC20 feeToken = new MockFeeOnTransferERC20("feeUSDC", "feeUSDC", 6, 200); // 2% fee
+        MockERC7540Vault feeVault = new MockERC7540Vault(address(feeToken));
+
+        SukukZapEscrow feeEscrow = new SukukZapEscrow(
+            operator, RECLAIM_DELAY, address(feeVault), address(vaultUsdt0), address(vaultHoney),
+            address(honeyFactoryMock), address(honey), address(usdeToken)
+        );
+
+        SukukZapEscrow.Intent memory i = _intent(user, 0, 0, 304);
+        address a = feeEscrow.intentAddress(i);
+        feeToken.mint(a, 100e6); // A holds 100e6; the A->escrow sweep transfer takes a 2% fee
+
+        vm.expectEmit(true, true, false, true);
+        emit SukukZapEscrow.IntentSettled(user, address(feeVault), 98e6, 1);
+
+        vm.prank(operator);
+        feeEscrow.operatorSettle(i); // must not revert
+
+        require(feeToken.balanceOf(a) == 0, "A must be fully drained regardless of the fee");
+    }
+
+    // ── 25. HONEY zero-mint refund no longer misattributes another intent's
+    //         stranded mint leftover — proves the _refundUnconsumed fix
+    //         (audit finding #2, cross-intent USDe dust misattribution) ─────
+
+    function testHoneyRefundDoesNotMisattributeAnotherIntentsMintLeftover() public {
+        // Intent A: a successful mint that only pulls 90% of its input,
+        // leaving 10e18 "dust" sitting in the shared escrow — a real, low-
+        // severity side effect this fix does not eliminate (see
+        // _refundUnconsumed's docs), but NOT itself a misattribution.
+        honeyFactoryMock.setPartialPullBps(9_000);
+        SukukZapEscrow.Intent memory intentA = _intentA(2, user, escrow.HONEY_VAULT_ID(), 1, 401);
+        address aA = escrow.intentAddress(intentA);
+        usdeToken.mint(aA, 100e18);
+        vm.prank(operator);
+        escrow.operatorSettle(intentA);
+        require(usdeToken.balanceOf(address(escrow)) == 10e18, "10e18 dust must remain from A's partial-pull mint");
+
+        // Intent B: a different, unrelated user hits the zero-mint edge case
+        // where the factory pulls B's FULL input and mints nothing.
+        honeyFactoryMock.setPartialPullBps(10_000);
+        honeyFactoryMock.setForceZeroMintPullsInput(true);
+        address userB = address(0xF00DFACE);
+        SukukZapEscrow.Intent memory intentB = _intentA(2, userB, escrow.HONEY_VAULT_ID(), 1, 402);
+        address aB = escrow.intentAddress(intentB);
+        usdeToken.mint(aB, 5e18);
+        vm.prank(operator);
+        escrow.operatorSettle(intentB);
+
+        // B's own contribution was fully consumed by B's own mint attempt,
+        // so B is owed nothing — critically, NOT A's 10e18 dust, which the
+        // old aggregate-balance _refundAvailable would have handed to B.
+        require(usdeToken.balanceOf(userB) == 0, "B must not receive A's stranded dust directly");
+        require(escrow.owed(userB, address(usdeToken)) == 0, "B must not be credited any of A's dust either");
+        require(usdeToken.balanceOf(address(escrow)) == 10e18, "A's dust must remain untouched, unattributed to B");
     }
 
     // ── Fork sanity check: real vault interfaces match what this contract assumes ──
