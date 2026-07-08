@@ -36,6 +36,12 @@ interface IIntentExecutor {
 interface IHoneyFactory {
     function mint(address asset, uint256 amount, address receiver, bool expectBasketMode) external returns (uint256);
     function isBasketModeEnabled(bool isMint) external view returns (bool);
+    // Verified live against the real, official Berachain HoneyFactory
+    // (0xA4aFef880F5cE1f63c9fb48F661E27F8B4216401, implementation
+    // 0x6331f0a4e0220a14be27bd31af091f0a1ac036a1) on 2026-07-08: a real,
+    // callable view function this contract's original minimal interface
+    // didn't know about — see _armThreshold's docs for why it matters.
+    function mintRates(address asset) external view returns (uint256 rate);
 }
 
 // ── Shared safe-transfer helpers ────────────────────────────────────────────
@@ -202,13 +208,28 @@ contract SukukZapEscrow {
     // (see _mintHoneyOrRefund), a raw USDe balance equal to i.minOut can
     // understate how much USDe is actually needed to guarantee i.minOut HONEY
     // out — making it cheaper than intended to arm the reclaim clock on a HONEY
-    // intent. This contract has no on-chain way to preview HoneyFactory's exact
-    // mint rate (the minimal IHoneyFactory interface exposes no rate-preview
-    // function), so this is a conservative, documented safety margin rather
-    // than an exact conversion — tune it if HoneyFactory's real worst-case mint
-    // efficiency is known precisely. 11_000 = require 110% of i.minOut in raw
-    // USDe terms before arming a HONEY intent's clock.
+    // intent. _armThreshold now queries the real HoneyFactory's mintRates(usde)
+    // live on every touch() call and computes a precise rate-derived threshold
+    // instead of a flat guess (verified 2026-07-08: mintRates exists and is
+    // callable on the real, official Berachain HoneyFactory — the minimal
+    // IHoneyFactory interface just never declared it before). This constant is
+    // now only the FALLBACK used if that live call ever fails or the asset
+    // isn't registered (returns a 0 rate) — kept deliberately conservative
+    // since it's the last line of defense, not the common path. 11_000 =
+    // require 110% of i.minOut in raw USDe terms in that fallback case.
     uint256 public constant HONEY_ARM_BUFFER_BPS = 11_000;
+
+    // Extra safety margin applied ON TOP of the live rate-derived threshold
+    // (the common path, not the fallback above). Covers what mintRates()
+    // alone doesn't capture: the untracked collateral-vault share-price hop
+    // between raw USDe and mint-eligible shares (amount -> shares -> HONEY;
+    // mintRates only prices the shares->HONEY leg), and mintRates itself
+    // being admin-settable and possibly changing between this touch() call
+    // and the eventual settle. 200 = require rate-derived-threshold * 102%.
+    // Real observed rates (2026-07-08, live on-chain): USDC.e/USDT0 = 99.9%,
+    // USDe = 100% — so this margin is real headroom, not a guess dressed up
+    // as one.
+    uint256 public constant HONEY_ARM_SAFETY_MARGIN_BPS = 200;
 
     // Third-party userReclaim only needs to outlast how long the operator's own
     // settlement bot could plausibly be down (crash/redeploy, RPC outage, a
@@ -757,10 +778,24 @@ contract SukukZapEscrow {
     ///      _settleTrustHandoff), so no buffer is needed — i.minOut applies
     ///      directly. For HONEY actions (2/3), the pre-settlement asset is USDe
     ///      but i.minOut is checked against the MINTED HONEY output downstream,
-    ///      a different unit entirely — see HONEY_ARM_BUFFER_BPS's docs for why
-    ///      a conservative buffer applies here instead of a 1:1 comparison.
-    function _armThreshold(Intent calldata i) internal pure returns (uint256) {
+    ///      a different unit entirely.
+    ///
+    ///      Queries the real HoneyFactory's mintRates(usde) live and computes
+    ///      a precise threshold: ceil(i.minOut * 1e18 / mintRate), plus
+    ///      HONEY_ARM_SAFETY_MARGIN_BPS on top. Wrapped in try/catch — a
+    ///      failed or reverting external call falls back to the flat
+    ///      HONEY_ARM_BUFFER_BPS guess instead of ever reverting, preserving
+    ///      touch()'s "never reverts for a valid intent" guarantee (its
+    ///      third-party liveness backstop depends on this call always
+    ///      succeeding as a no-op-or-arm, never reverting).
+    function _armThreshold(Intent calldata i) internal view returns (uint256) {
         if (i.action == ACTION_USDE_HONEY_DUPRT || i.action == ACTION_USDE_HONEY_TRUST) {
+            try IHoneyFactory(honeyFactory).mintRates(usde) returns (uint256 mintRate) {
+                if (mintRate > 0) {
+                    uint256 rateAdjusted = (i.minOut * 1e18 + mintRate - 1) / mintRate; // ceiling division
+                    return (rateAdjusted * (10_000 + HONEY_ARM_SAFETY_MARGIN_BPS)) / 10_000;
+                }
+            } catch {}
             return (i.minOut * HONEY_ARM_BUFFER_BPS) / 10_000;
         }
         return i.minOut;

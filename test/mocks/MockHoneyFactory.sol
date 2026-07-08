@@ -27,11 +27,21 @@ interface IMintableERC20 {
  *           *successful* mint (nonzero HONEY out) that only pulls this
  *           fraction of the approved `amount`, leaving the rest as unswept
  *           collateral in the caller (the escrow) — models a sub-100%
- *           mint rate on the success path, as opposed to the two explicit
- *           zero-output edge cases above. Exists to reproduce the audit
- *           finding about cross-intent USDe dust misattribution: this is
- *           the mode that actually produces leftover dust after a
- *           *successful* mint, which the two zero-output modes don't.
+ *           mint rate on the success path. Verified 2026-07-08 against the
+ *           real, official Berachain HoneyFactory source
+ *           (0x6331f0a4e0220a14be27bd31af091f0a1ac036a1): this mode does
+ *           NOT match reality — the real factory's `_approveAndDeposit`
+ *           always pulls the exact approved amount via `safeTransferFrom`
+ *           before computing any output, so a successful mint never leaves
+ *           unconsumed collateral. Kept anyway as defense-in-depth coverage
+ *           (SukukZapEscrow's fix shouldn't depend on this specific
+ *           factory's exact guarantees holding forever).
+ *
+ *         `mintRates` mirrors the real factory's actual
+ *         `mintRates(address) view returns (uint256)` getter (also verified
+ *         live on-chain 2026-07-08) — defaults to 0 (unregistered) for every
+ *         asset so existing tests keep exercising SukukZapEscrow's fallback
+ *         path unchanged; set explicitly to exercise the live-rate path.
  */
 contract MockHoneyFactory {
     address public collateral;
@@ -40,6 +50,7 @@ contract MockHoneyFactory {
     bool public forceZeroMintPullsInput;
     bool public forceZeroMintNoPull;
     uint256 public partialPullBps = 10_000;
+    mapping(address => uint256) public mintRates;
 
     constructor(address _collateral, address _honeyToken) {
         collateral = _collateral;
@@ -60,6 +71,10 @@ contract MockHoneyFactory {
 
     function setPartialPullBps(uint256 v) external {
         partialPullBps = v;
+    }
+
+    function setMintRate(address asset, uint256 rate) external {
+        mintRates[asset] = rate;
     }
 
     function isBasketModeEnabled(bool) external pure returns (bool) {

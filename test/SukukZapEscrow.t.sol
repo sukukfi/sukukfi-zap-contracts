@@ -542,6 +542,55 @@ contract SukukZapEscrowTest {
         require(escrow.firstTouchedAt(salt) != 0, "110% of minOut in USDe must arm a HONEY intent's clock");
     }
 
+    // ── 19d. touch() uses the real HoneyFactory's live mintRates() when
+    //         available, arming at a much tighter threshold than the flat
+    //         110% fallback — verified against the real, official Berachain
+    //         HoneyFactory's actual on-chain rate for USDC.e/USDT0 (99.9%,
+    //         2026-07-08) ─────────────────────────────────────────────────
+
+    function testHoneyTouchUsesLiveMintRateWhenAvailable() public {
+        honeyFactoryMock.setMintRate(address(usdeToken), 0.999e18); // real observed USDC.e/USDT0 rate
+
+        SukukZapEscrow.Intent memory i = _intentA(2, user, escrow.HONEY_VAULT_ID(), 100e18, 91);
+        bytes32 salt = keccak256(abi.encode(i));
+        address a = escrow.intentAddress(i);
+
+        // ceil(100e18 * 1e18 / 0.999e18) * 1.02 = 102102102102102102103,
+        // i.e. ~102.1% of minOut — well under the old flat 110% fallback.
+        // One wei below this must NOT arm.
+        usdeToken.mint(a, 102102102102102102102);
+        vm.prank(address(0xBEEF));
+        escrow.touch(i);
+        require(escrow.firstTouchedAt(salt) == 0, "one wei below the live-rate threshold must not arm");
+
+        usdeToken.mint(a, 1); // now exactly at the computed threshold
+        vm.prank(address(0xBEEF));
+        escrow.touch(i);
+        require(escrow.firstTouchedAt(salt) != 0, "reaching the live-rate threshold must arm, well below the old 110% guess");
+    }
+
+    // ── 19e. If mintRates() is unset/unavailable (returns 0), touch() falls
+    //         back to the flat buffer instead of reverting or mis-arming ───
+
+    function testHoneyTouchFallsBackWhenMintRateUnset() public {
+        // honeyFactoryMock.mintRates(usde) defaults to 0 — never set in setUp().
+        require(honeyFactoryMock.mintRates(address(usdeToken)) == 0, "precondition: mint rate must be unset");
+
+        SukukZapEscrow.Intent memory i = _intentA(2, user, escrow.HONEY_VAULT_ID(), 1e18, 92);
+        bytes32 salt = keccak256(abi.encode(i));
+        address a = escrow.intentAddress(i);
+
+        usdeToken.mint(a, 1.05e18); // below the 110% fallback threshold
+        vm.prank(address(0xBEEF));
+        escrow.touch(i);
+        require(escrow.firstTouchedAt(salt) == 0, "must not arm below the fallback threshold when rate is unset");
+
+        usdeToken.mint(a, 0.05e18); // total 1.1e18 = the fallback's 110%
+        vm.prank(address(0xBEEF));
+        escrow.touch(i);
+        require(escrow.firstTouchedAt(salt) != 0, "must arm at the fallback threshold when rate is unset");
+    }
+
     // ── 19c. touch() emits IntentTouched exactly when it arms the clock — the
     //         on-chain signal an off-chain watcher indexes to detect stuck
     //         intents, since intent addresses are otherwise unregistered ──────
