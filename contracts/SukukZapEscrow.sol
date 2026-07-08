@@ -242,7 +242,12 @@ contract SukukZapEscrow {
 
     // ── Events ───────────────────────────────────────────────────────────────
 
-    event IntentSettled(address indexed user, address indexed vault, uint256 amount);
+    // requestId is the ERC-7540 request ID requestDeposit() returns — needed
+    // to look up the pending request via the vault's own
+    // pendingDepositRequest(requestId, controller), and previously discarded
+    // entirely (unused-return), leaving no on-chain way to correlate a
+    // settlement with its vault-side request without re-deriving it.
+    event IntentSettled(address indexed user, address indexed vault, uint256 amount, uint256 requestId);
     event IntentHandedToOperator(address indexed user, uint8 indexed vaultId, address indexed asset, uint256 amount);
     event IntentRefunded(address indexed user, address indexed asset, uint256 amount);
     event IntentReclaimed(address indexed user, address indexed asset, uint256 amount);
@@ -271,6 +276,17 @@ contract SukukZapEscrow {
     ) {
         require(_operator != address(0), "operator: zero address");
         require(_reclaimDelay >= MIN_RECLAIM_DELAY, "reclaimDelay too small");
+        // _duprtUsdcE/_duprtUsdt0/_duprtHoney aren't checked here: a zero entry
+        // in duprtVaults is already caught per-call by every settle/reclaim
+        // path's own `require(vault != address(0), "unknown vault")`. These
+        // three have no such downstream guard — a zero address here would
+        // make every HONEY-touching call silently no-op (a low-level `.call()`
+        // to a no-code address returns success with empty returndata, which
+        // _safeERC20Call's non-standard-token tolerance treats as a genuine
+        // success), so they're checked here instead, matching _operator.
+        require(_honeyFactory != address(0), "honeyFactory: zero address");
+        require(_honey != address(0), "honey: zero address");
+        require(_usde != address(0), "usde: zero address");
         operator = _operator;
         reclaimDelay = _reclaimDelay;
         honeyFactory = _honeyFactory;
@@ -353,9 +369,9 @@ contract SukukZapEscrow {
         }
 
         _forceApprove(asset, vault, amount);
-        try IERC7540Vault(vault).requestDeposit(amount, i.user, address(this)) returns (uint256) {
+        try IERC7540Vault(vault).requestDeposit(amount, i.user, address(this)) returns (uint256 requestId) {
             _forceApprove(asset, vault, 0);
-            emit IntentSettled(i.user, vault, amount);
+            emit IntentSettled(i.user, vault, amount, requestId);
         } catch {
             _forceApprove(asset, vault, 0);
             _refund(i.user, asset, amount);
@@ -415,9 +431,9 @@ contract SukukZapEscrow {
         }
 
         _forceApprove(honey, vault, honeyAmount);
-        try IERC7540Vault(vault).requestDeposit(honeyAmount, i.user, address(this)) returns (uint256) {
+        try IERC7540Vault(vault).requestDeposit(honeyAmount, i.user, address(this)) returns (uint256 requestId) {
             _forceApprove(honey, vault, 0);
-            emit IntentSettled(i.user, vault, honeyAmount);
+            emit IntentSettled(i.user, vault, honeyAmount, requestId);
         } catch {
             _forceApprove(honey, vault, 0);
             _refund(i.user, honey, honeyAmount);

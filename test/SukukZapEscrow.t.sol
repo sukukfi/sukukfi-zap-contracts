@@ -92,6 +92,37 @@ contract SukukZapEscrowTest {
         return SukukZapEscrow.Intent({action: action, user: u, vaultId: vaultId, minOut: minOut, nonce: nonce});
     }
 
+    // ── 0b. Constructor rejects a zero honeyFactory/honey/usde — these three
+    //         have no downstream `require(!= address(0))` guard the way
+    //         duprtVaults entries do (caught per-call by "unknown vault"), so
+    //         a misconfigured zero here would otherwise let every HONEY call
+    //         silently no-op instead of reverting (the missing-zero-check
+    //         finding) ──────────────────────────────────────────────────────
+
+    function testConstructorRejectsZeroHoneyFactory() public {
+        vm.expectRevert(bytes("honeyFactory: zero address"));
+        new SukukZapEscrow(
+            operator, RECLAIM_DELAY, address(vaultUsdc), address(vaultUsdt0), address(vaultHoney),
+            address(0), address(honey), address(usdeToken)
+        );
+    }
+
+    function testConstructorRejectsZeroHoney() public {
+        vm.expectRevert(bytes("honey: zero address"));
+        new SukukZapEscrow(
+            operator, RECLAIM_DELAY, address(vaultUsdc), address(vaultUsdt0), address(vaultHoney),
+            address(honeyFactoryMock), address(0), address(usdeToken)
+        );
+    }
+
+    function testConstructorRejectsZeroUsde() public {
+        vm.expectRevert(bytes("usde: zero address"));
+        new SukukZapEscrow(
+            operator, RECLAIM_DELAY, address(vaultUsdc), address(vaultUsdt0), address(vaultHoney),
+            address(honeyFactoryMock), address(honey), address(0)
+        );
+    }
+
     // ── 1. intentAddress matches a manually-computed CREATE2 address ────────
 
     function testIntentAddressMatchesCreate2() public {
@@ -119,6 +150,24 @@ contract SukukZapEscrowTest {
 
         require(usdc.balanceOf(a) == 0, "A should be fully drained after settle");
         require(vaultUsdc.pendingDepositRequest(1, user) == 100e6, "vault should credit user's request");
+    }
+
+    // ── 2b. IntentSettled carries the real requestId (previously discarded —
+    //         the unused-return finding), so it's correlatable on-chain with
+    //         the vault's own pendingDepositRequest(requestId, controller) ──
+
+    function testIntentSettledEmitsRealRequestId() public {
+        SukukZapEscrow.Intent memory i = _intent(user, 0, 0, 101);
+        address a = escrow.intentAddress(i);
+        usdc.mint(a, 25e6);
+
+        // MockERC7540Vault's nextRequestId starts at 1 and is fresh per-vault
+        // per setUp(), so the first request against vaultUsdc in this test is
+        // deterministically requestId 1.
+        vm.expectEmit(true, true, false, true);
+        emit SukukZapEscrow.IntentSettled(user, address(vaultUsdc), 25e6, 1);
+        vm.prank(operator);
+        escrow.operatorSettle(i);
     }
 
     // ── 3. Early/zero-balance settle is a safe no-op; later delivery still settles ──
