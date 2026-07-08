@@ -856,6 +856,75 @@ contract SukukZapEscrowTest {
         require(usdeToken.balanceOf(address(escrow)) == 10e18, "A's dust must remain untouched, unattributed to B");
     }
 
+    // ── 26. rescueToken recovers a mismatched token for a valid intent,
+    //         but refuses to touch the intent's own reserved asset ─────────
+
+    function testRescueTokenRecoversMismatchedToken() public {
+        SukukZapEscrow.Intent memory i = _intent(user, 0, 0, 500); // vaultId 0 -> reserved asset is usdc
+        address a = escrow.intentAddress(i);
+
+        // HONEY mistakenly delivered to a USDC.e intent's address — not the
+        // asset this intent expects, and not reachable via any settle path.
+        honey.mint(a, 7e18);
+
+        vm.prank(address(0xBEEF)); // permissionless — any caller
+        escrow.rescueToken(i, address(honey));
+
+        require(honey.balanceOf(user) == 7e18, "mismatched token must be rescued to i.user");
+        require(honey.balanceOf(a) == 0, "A must be drained of the rescued token");
+    }
+
+    function testRescueTokenRejectsIntentsOwnReservedAsset() public {
+        SukukZapEscrow.Intent memory i = _intent(user, 0, 1e6, 501); // vaultId 0 -> reserved asset is usdc
+        address a = escrow.intentAddress(i);
+        usdc.mint(a, 5e6);
+
+        vm.expectRevert(bytes("use the normal settle/reclaim path for this intent's own asset"));
+        escrow.rescueToken(i, address(usdc));
+    }
+
+    // ── 27. rescueToken recovers ANY token — including what would otherwise
+    //         look like a "reserved" asset — when the intent itself is
+    //         malformed and so has no normal recovery path at all ─────────
+
+    function testRescueTokenRecoversAnyTokenForOutOfRangeAction() public {
+        SukukZapEscrow.Intent memory i = _intentA(200, user, 0, 0, 502); // action 200 doesn't exist
+        address a = escrow.intentAddress(i);
+        usdeToken.mint(a, 3e18); // even usde, normally reserved for HONEY actions, is rescuable here
+
+        vm.prank(address(0xBEEF));
+        escrow.rescueToken(i, address(usdeToken));
+
+        require(usdeToken.balanceOf(user) == 3e18, "any token must be rescuable for a malformed (out-of-range action) intent");
+    }
+
+    function testRescueTokenRecoversAnyTokenForUnregisteredVaultId() public {
+        SukukZapEscrow.Intent memory i = _intent(user, 99, 0, 503); // vaultId 99 was never registered
+        address a = escrow.intentAddress(i);
+        usdc.mint(a, 4e6);
+
+        vm.prank(address(0xBEEF));
+        escrow.rescueToken(i, address(usdc));
+
+        require(usdc.balanceOf(user) == 4e6, "any token must be rescuable when vaultId maps to no registered vault");
+    }
+
+    // ── 28. rescueToken falls back to owed on a blacklisted/reverting i.user,
+    //         same as _refund/userReclaim ──────────────────────────────────
+
+    function testRescueTokenCreditsOwedOnBlacklistedRecipient() public {
+        MockBlacklistableERC20 blacklistable = new MockBlacklistableERC20("RANDOM", "RND", 18);
+        blacklistable.setBlacklisted(user, true);
+
+        SukukZapEscrow.Intent memory i = _intent(user, 0, 0, 504);
+        address a = escrow.intentAddress(i);
+        blacklistable.mint(a, 2e18);
+
+        escrow.rescueToken(i, address(blacklistable)); // must not revert
+
+        require(escrow.owed(user, address(blacklistable)) == 2e18, "rescueToken must credit owed on a reverting recipient");
+    }
+
     // ── Fork sanity check: real vault interfaces match what this contract assumes ──
 
     function testForkVaultAssetsMatchRealTokens() public {

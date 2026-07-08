@@ -310,6 +310,8 @@ contract SukukZapEscrow {
     // transfer to `user` reverted — see `owed`'s docs.
     event RefundCredited(address indexed user, address indexed asset, uint256 amount);
     event OwedWithdrawn(address indexed user, address indexed asset, uint256 amount);
+    // Emitted by rescueToken() — see its docs.
+    event TokenRescued(address indexed user, address indexed token, uint256 amount);
 
     // Emitted exactly once per funding round, the moment touch() durably arms
     // the reclaim clock (see touch()'s docs). This is the only on-chain signal
@@ -632,6 +634,61 @@ contract SukukZapEscrow {
         owed[msg.sender][asset] = 0;
         _safeTransfer(asset, msg.sender, amount);
         emit OwedWithdrawn(msg.sender, asset, amount);
+    }
+
+    /**
+     * @notice Permissionless rescue for any token stuck at an intent's
+     *         CREATE2 address `A` that the normal settle/reclaim/touch paths
+     *         can never reach — either `token` isn't the asset this intent
+     *         actually expects (a bridge or frontend delivered the wrong
+     *         one), or the intent itself is malformed (an out-of-range
+     *         `action`, or a `vaultId` that maps to no registered vault) and
+     *         so has no normal recovery path for ANY asset at all.
+     * @dev    Always pays `i.user`, never `msg.sender` — a third party gains
+     *         nothing by calling this on someone else's intent, matching
+     *         every other refund/reclaim path. Explicitly refuses to touch
+     *         the intent's own reserved asset when the intent is
+     *         well-formed, forcing that asset through the normal
+     *         settle/userReclaim path (minOut- and reclaimDelay-aware)
+     *         instead of this side door. Routes through the same `owed`
+     *         pull-payment fallback as `_refund`/`userReclaim` for a
+     *         reverting/blacklisted `i.user`. Never touches `firstTouchedAt`
+     *         — that mapping only ever tracks the reserved asset, which this
+     *         function is barred from moving, so there is nothing to clear.
+     */
+    function rescueToken(Intent calldata i, address token) external nonReentrant {
+        address reserved = _reservedAssetOrZero(i);
+        require(reserved == address(0) || token != reserved, "use the normal settle/reclaim path for this intent's own asset");
+
+        address a = _ensureExecutor(i);
+        uint256 amount = IIntentExecutor(a).sweep(token, address(this));
+        if (amount == 0) return;
+
+        if (_tryTransfer(token, i.user, amount)) {
+            emit TokenRescued(i.user, token, amount);
+        } else {
+            owed[i.user][token] += amount;
+            emit RefundCredited(i.user, token, amount);
+        }
+    }
+
+    /// @dev Non-reverting counterpart to _resolveReclaimAsset, used only by
+    ///      rescueToken() to determine which single asset (if any) is
+    ///      already recoverable through the normal settle/reclaim path for
+    ///      this intent. Returns address(0) for a malformed intent
+    ///      (out-of-range action, or a vaultId that resolves to an
+    ///      unregistered/zero vault) — in that case nothing is recoverable
+    ///      any other way, so rescueToken() must be allowed to sweep any
+    ///      token, not just an "other" one.
+    function _reservedAssetOrZero(Intent calldata i) internal view returns (address) {
+        if (i.action == ACTION_USDE_HONEY_DUPRT || i.action == ACTION_USDE_HONEY_TRUST) {
+            return i.vaultId == HONEY_VAULT_ID ? usde : address(0);
+        }
+        if (i.action == ACTION_DUPRT || i.action == ACTION_TRUST) {
+            address vault = duprtVaults[i.vaultId];
+            return vault == address(0) ? address(0) : IERC7540Vault(vault).asset();
+        }
+        return address(0); // unknown action
     }
 
     // ── User / permissionless reclaim ────────────────────────────────────────
