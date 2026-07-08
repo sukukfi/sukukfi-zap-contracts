@@ -321,7 +321,16 @@ contract SukukZapEscrow {
     // registered anywhere. An off-chain watcher can index this event and alert
     // if operatorSettle hasn't resolved it (via IntentSettled/IntentHandedToOperator)
     // within some operational SLA, without needing any separate intent registry.
-    event IntentTouched(bytes32 indexed salt, address indexed user, uint8 action, uint8 vaultId, address asset, uint256 amount);
+    //
+    // minOut and nonce are included alongside the fields already needed for
+    // alerting (action/vaultId/asset/amount) so this event alone is enough to
+    // reconstruct the exact Intent struct userReclaim() requires — without
+    // them, a keeper watching this event would know an intent is stuck but
+    // have no way to call userReclaim() on it at all, since salt is a hash
+    // and can't be reversed back into its inputs.
+    event IntentTouched(
+        bytes32 indexed salt, address indexed user, uint8 action, uint8 vaultId, address asset, uint256 amount, uint256 minOut, uint256 nonce
+    );
 
     // ── Constructor ──────────────────────────────────────────────────────────
 
@@ -743,7 +752,7 @@ contract SukukZapEscrow {
             uint256 amount = IERC20(asset).balanceOf(intentAddress(i));
             if (amount >= _armThreshold(i)) {
                 firstTouchedAt[salt] = block.timestamp;
-                emit IntentTouched(salt, i.user, i.action, i.vaultId, asset, amount);
+                emit IntentTouched(salt, i.user, i.action, i.vaultId, asset, amount, i.minOut, i.nonce);
             }
         }
     }

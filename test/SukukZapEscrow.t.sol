@@ -609,7 +609,7 @@ contract SukukZapEscrowTest {
         // Reaching minOut: touch() must emit IntentTouched with the observed amount.
         usdc.mint(a, 0.5e6); // total 1e6 = minOut
         vm.expectEmit(true, true, false, true);
-        emit SukukZapEscrow.IntentTouched(salt, user, 0, 0, address(usdc), 1e6);
+        emit SukukZapEscrow.IntentTouched(salt, user, 0, 0, address(usdc), 1e6, 1e6, 91);
         vm.prank(address(0xBEEF));
         escrow.touch(i);
         require(escrow.firstTouchedAt(salt) != 0, "reaching minOut must arm the clock");
