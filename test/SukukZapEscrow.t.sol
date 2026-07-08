@@ -490,6 +490,35 @@ contract SukukZapEscrowTest {
         require(escrow.firstTouchedAt(salt) != 0, "110% of minOut in USDe must arm a HONEY intent's clock");
     }
 
+    // ── 19c. touch() emits IntentTouched exactly when it arms the clock — the
+    //         on-chain signal an off-chain watcher indexes to detect stuck
+    //         intents, since intent addresses are otherwise unregistered ──────
+
+    function testTouchEmitsIntentTouchedOnlyWhenArming() public {
+        SukukZapEscrow.Intent memory i = _intent(user, 0, 1e6, 91);
+        bytes32 salt = keccak256(abi.encode(i));
+        address a = escrow.intentAddress(i);
+
+        // Below minOut: touch() must not emit anything.
+        usdc.mint(a, 0.5e6);
+        vm.prank(address(0xBEEF));
+        escrow.touch(i);
+        require(escrow.firstTouchedAt(salt) == 0, "dust below minOut must not arm the clock");
+
+        // Reaching minOut: touch() must emit IntentTouched with the observed amount.
+        usdc.mint(a, 0.5e6); // total 1e6 = minOut
+        vm.expectEmit(true, true, false, true);
+        emit SukukZapEscrow.IntentTouched(salt, user, 0, 0, address(usdc), 1e6);
+        vm.prank(address(0xBEEF));
+        escrow.touch(i);
+        require(escrow.firstTouchedAt(salt) != 0, "reaching minOut must arm the clock");
+
+        // Already armed: firstTouchedAt[salt] != 0 short-circuits touch() before
+        // it reaches the emit, by construction — a second call is a plain no-op.
+        vm.prank(address(0xBEEF));
+        escrow.touch(i);
+    }
+
     // ── 20. USDe→HONEY→trUST (action 3): mints then hands HONEY to operator ──
 
     function testHoneyTrustHandoffHappyPath() public {

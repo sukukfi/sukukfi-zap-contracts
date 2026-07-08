@@ -14,6 +14,7 @@ interface Vm {
     function warp(uint256 newTimestamp) external;
     function expectRevert(bytes calldata revertData) external;
     function expectRevert() external;
+    function expectEmit(bool checkTopic1, bool checkTopic2, bool checkTopic3, bool checkData) external;
     function createSelectFork(string calldata urlOrAlias) external returns (uint256 forkId);
 }
 

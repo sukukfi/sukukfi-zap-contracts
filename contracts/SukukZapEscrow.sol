@@ -233,6 +233,16 @@ contract SukukZapEscrow {
     event IntentRefunded(address indexed user, address indexed asset, uint256 amount);
     event IntentReclaimed(address indexed user, address indexed asset, uint256 amount);
 
+    // Emitted exactly once per funding round, the moment touch() durably arms
+    // the reclaim clock (see touch()'s docs). This is the only on-chain signal
+    // that an intent has real funds sitting at its CREATE2 address awaiting
+    // operatorSettle — nothing else about an intent is observable on-chain
+    // before this fires, since intent addresses are counterfactual and never
+    // registered anywhere. An off-chain watcher can index this event and alert
+    // if operatorSettle hasn't resolved it (via IntentSettled/IntentHandedToOperator)
+    // within some operational SLA, without needing any separate intent registry.
+    event IntentTouched(bytes32 indexed salt, address indexed user, uint8 action, uint8 vaultId, address asset, uint256 amount);
+
     // ── Constructor ──────────────────────────────────────────────────────────
 
     constructor(
@@ -530,8 +540,15 @@ contract SukukZapEscrow {
     function touch(Intent calldata i) external {
         address asset = _resolveReclaimAsset(i);
         bytes32 salt = keccak256(abi.encode(i));
-        if (firstTouchedAt[salt] == 0 && IERC20(asset).balanceOf(intentAddress(i)) >= _armThreshold(i) && i.minOut > 0) {
-            firstTouchedAt[salt] = block.timestamp;
+        // Checking i.minOut > 0 before the balanceOf call (unlike the original
+        // left-to-right && order) skips a wasted external call on intents that
+        // can never arm at all — same outcome, one fewer read on that path.
+        if (firstTouchedAt[salt] == 0 && i.minOut > 0) {
+            uint256 amount = IERC20(asset).balanceOf(intentAddress(i));
+            if (amount >= _armThreshold(i)) {
+                firstTouchedAt[salt] = block.timestamp;
+                emit IntentTouched(salt, i.user, i.action, i.vaultId, asset, amount);
+            }
         }
     }
 
