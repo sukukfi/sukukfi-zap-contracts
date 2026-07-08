@@ -222,9 +222,23 @@ contract SukukZapEscrow {
     // 0 = never funded yet, or the last funding round already resolved.
     mapping(bytes32 => uint256) public firstTouchedAt;
 
-    uint256 private _status;
-    uint256 private constant _NOT_ENTERED = 1;
-    uint256 private constant _ENTERED = 2;
+    // Reentrancy lock, held in transient storage (EIP-1153) rather than
+    // regular storage: TSTORE/TLOAD cost ~100 gas flat versus SSTORE/SLOAD's
+    // multi-thousand-gas cold/warm pricing, and transient storage is
+    // guaranteed zero at the start of every transaction — no constructor
+    // initialization needed, and no risk class from a skipped reset (there
+    // isn't one here regardless; nonReentrant always resets unconditionally
+    // after `_`). Requires evm_version = "cancun" (set in foundry.toml,
+    // verified live against Berachain's own RPC before adopting).
+    //
+    // solc 0.8.24 (pinned in foundry.toml) has no `transient` state-variable
+    // keyword yet — that lands in a later compiler version — so the slot is
+    // accessed directly via inline tstore/tload instead, the same approach
+    // jtriley2p's mutexer library uses under the same compiler constraint.
+    // `- 1` on the slot constant follows the same unstructured-storage
+    // convention (avoid a slot that's the direct keccak256 of a short,
+    // guessable preimage) used by ERC-1967 and by mutexer itself.
+    uint256 private constant _REENTRANCY_LOCK_SLOT = uint256(keccak256("SukukZapEscrow.reentrancyLock")) - 1;
 
     // ── Events ───────────────────────────────────────────────────────────────
 
@@ -266,17 +280,24 @@ contract SukukZapEscrow {
         duprtVaults[0] = _duprtUsdcE;
         duprtVaults[1] = _duprtUsdt0;
         duprtVaults[HONEY_VAULT_ID] = _duprtHoney;
-
-        _status = _NOT_ENTERED;
     }
 
     // ── Modifiers ────────────────────────────────────────────────────────────
 
     modifier nonReentrant() {
-        require(_status != _ENTERED, "reentrant call");
-        _status = _ENTERED;
+        uint256 slot = _REENTRANCY_LOCK_SLOT;
+        uint256 locked;
+        assembly {
+            locked := tload(slot)
+        }
+        require(locked == 0, "reentrant call");
+        assembly {
+            tstore(slot, 1)
+        }
         _;
-        _status = _NOT_ENTERED;
+        assembly {
+            tstore(slot, 0)
+        }
     }
 
     // ── CREATE2 addressing ───────────────────────────────────────────────────

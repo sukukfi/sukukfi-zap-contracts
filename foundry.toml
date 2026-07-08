@@ -5,3 +5,16 @@ libs = ["lib"]
 solc = "0.8.24"
 optimizer = true
 optimizer_runs = 200
+# cancun: required for the tstore/tload opcodes SukukZapEscrow's nonReentrant
+# guard uses via inline assembly (contracts/SukukZapEscrow.sol — solc 0.8.24
+# has no `transient` state-variable keyword yet, so this is hand-rolled, not
+# compiler-assisted). Verified live against Berachain's own RPC
+# (eth_getBlockByNumber returns blobGasUsed/excessBlobGas, which only exist
+# post-Cancun) before adopting.
+evm_version = "cancun"
+# via_ir enabled to avoid "stack too deep" in the fizz stateful-fuzzing
+# handlers (test/fizz/handlers/SukukZapEscrowHandler.sol), which snapshot many
+# before/after balances per call and legitimately need more local variables
+# than the legacy codegen's stack can hold. Does not change contract
+# bytecode/behavior for contracts/ (only affects compilation strategy).
+via_ir = true

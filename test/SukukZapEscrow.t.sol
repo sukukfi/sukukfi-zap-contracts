@@ -5,6 +5,7 @@ import "../contracts/SukukZapEscrow.sol";
 import "./mocks/MockERC20.sol";
 import "./mocks/MockERC7540Vault.sol";
 import "./mocks/MockHoneyFactory.sol";
+import "./mocks/MaliciousReentrantVault.sol";
 import "./Vm.sol";
 
 /**
@@ -517,6 +518,48 @@ contract SukukZapEscrowTest {
         // it reaches the emit, by construction — a second call is a plain no-op.
         vm.prank(address(0xBEEF));
         escrow.touch(i);
+    }
+
+    // ── 19d. nonReentrant actually blocks a cross-function reentrant call —
+    //         proves the transient-storage lock (contracts/SukukZapEscrow.sol)
+    //         works end-to-end, not just that it compiles and costs less gas.
+    //         A malicious vault reenters into userReclaim() for the SAME
+    //         intent from inside operatorSettle()'s own requestDeposit call ──
+
+    function testNonReentrantBlocksCrossFunctionReentrancy() public {
+        MaliciousReentrantVault evilVault = new MaliciousReentrantVault(address(usdc), address(0));
+
+        SukukZapEscrow evilEscrow = new SukukZapEscrow(
+            operator,
+            RECLAIM_DELAY,
+            address(evilVault), // vaultId 0 — the malicious one
+            address(vaultUsdt0),
+            address(vaultHoney),
+            address(honeyFactoryMock),
+            address(honey),
+            address(usdeToken)
+        );
+        evilVault.setEscrow(address(evilEscrow));
+
+        SukukZapEscrow.Intent memory i = _intent(user, 0, 1e6, 200);
+        address a = evilEscrow.intentAddress(i);
+        usdc.mint(a, 5e6);
+
+        evilVault.setReentryCalldata(abi.encodeWithSelector(evilEscrow.userReclaim.selector, i));
+
+        vm.prank(operator);
+        evilEscrow.operatorSettle(i);
+
+        require(evilVault.reentryAttempted(), "malicious vault must have attempted the reentrant call");
+        require(!evilVault.reentrySucceeded(), "reentrant userReclaim must be blocked by the lock, not silently succeed");
+        require(
+            keccak256(evilVault.reentryReturnData()) == keccak256(abi.encodeWithSignature("Error(string)", "reentrant call")),
+            "must be blocked specifically by the reentrancy guard, not some unrelated revert"
+        );
+
+        // The outer settlement itself must still complete normally — the
+        // guard blocks the attacker's nested call, not the legitimate one.
+        require(evilVault.pendingDepositRequest(1, user) == 5e6, "legitimate outer settlement must still succeed");
     }
 
     // ── 20. USDe→HONEY→trUST (action 3): mints then hands HONEY to operator ──
